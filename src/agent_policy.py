@@ -30,6 +30,125 @@ _LATTICE_DELTAS = (
     (1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1),
 )
 
+# When True, pick_target rejects any pivot whose target leaves the z=0
+# plane (2D kinematic demos). Off by default so MC paths are unaffected;
+# set via ``agent_policy.PLANAR_Z_LOCK = True``.
+PLANAR_Z_LOCK = False
+
+# Minimum center-to-center clearance (in module diameters ~1.0) sampled
+# along the pivot arc for the planar sweep check. Bonded contact is 1.0.
+_PLANAR_SWEEP_CLEARANCE = 0.95
+
+
+def _planar_arc_clear(pos, my_idx: int, axis_idx: int,
+                      target_world: np.ndarray, n_total: int,
+                      long_way: bool = False) -> bool:
+    """True if the in-plane pivot arc from ``pos[my_idx]`` to
+    ``target_world`` about ``pos[axis_idx]`` stays clear of every other
+    module. Mirrors GraphSimulator.step: a rotation of the start offset
+    about the axis, plus the radius lerp toward the target that the
+    end-of-pivot snap performs (relevant for lateral handoffs).
+    ``long_way`` tests the complementary arc (rolling around the free
+    side, 2*pi - theta in the opposite direction).
+    """
+    a = pos[axis_idx]
+    r0 = pos[my_idx] - a
+    rt = np.asarray(target_world, dtype=float) - a
+    n0 = float(np.linalg.norm(r0))
+    nt = float(np.linalg.norm(rt))
+    if n0 < 1e-9 or nt < 1e-9:
+        return True
+    u0, ut = r0 / n0, rt / nt
+    dot = float(np.clip(np.dot(u0, ut), -1.0, 1.0))
+    ang = float(np.arccos(dot))
+    sgn = 1.0 if (u0[0] * ut[1] - u0[1] * ut[0]) >= 0.0 else -1.0
+    if long_way:
+        ang, sgn = 2.0 * np.pi - ang, -sgn
+    samples = max(9, int(np.ceil(ang / (np.pi / 16))))
+    for k in range(1, samples):
+        t = k / (samples - 1)
+        th = sgn * ang * t
+        c, s = np.cos(th), np.sin(th)
+        dir_v = np.array(
+            [c * u0[0] - s * u0[1], s * u0[0] + c * u0[1], 0.0])
+        for rad in (n0, n0 + (nt - n0) * t):
+            p = a + rad * dir_v
+            for j in range(n_total):
+                if j == my_idx or j == axis_idx:
+                    continue
+                if float(np.linalg.norm(p - pos[j])) \
+                        < _PLANAR_SWEEP_CLEARANCE:
+                    return False
+    return True
+
+
+def _planar_pivot_admissible(pos, my_idx: int, axis_idx: int,
+                             target_world, n_total: int) -> bool:
+    """A planar corner pivot is admissible if either arc direction is clear."""
+    return (_planar_arc_clear(pos, my_idx, axis_idx, target_world, n_total)
+            or _planar_arc_clear(pos, my_idx, axis_idx, target_world,
+                                 n_total, long_way=True))
+
+
+def _planar_lateral_clear(pos, my_idx: int, axis_idx: int, handoff_idx: int,
+                          target_world, n_total: int,
+                          nom: float = 1.0) -> bool:
+    """Sweep check for the physically rolled lateral path: an arc about
+    the axis until contact with the handoff module, then an arc about the
+    handoff to the target (matches GraphSimulator.TWO_ARC_LATERAL)."""
+    a = pos[axis_idx]
+    h = pos[handoff_idx]
+    r0 = pos[my_idx] - a
+    rh = h - a
+    n0, nh = float(np.linalg.norm(r0)), float(np.linalg.norm(rh))
+    if n0 < 1e-9 or nh < 1e-9:
+        return True
+    cos_sep = float(np.clip(np.dot(r0, rh) / (n0 * nh), -1.0, 1.0))
+    sep0 = float(np.arccos(cos_sep))
+    cos_c = (n0 * n0 + nh * nh - nom * nom) / (2.0 * n0 * nh)
+    if not -1.0 <= cos_c <= 1.0:
+        return True
+    sep_c = float(np.arccos(cos_c))
+    d1 = max(0.0, sep0 - sep_c)
+    sgn1 = 1.0 if (r0[0] * rh[1] - r0[1] * rh[0]) >= 0.0 else -1.0
+
+    def _arc_pts(anchor, r_start, sgn, dtheta):
+        samples = max(5, int(np.ceil(dtheta / (np.pi / 16))))
+        for k in range(1, samples + 1):
+            th = sgn * dtheta * (k / samples)
+            c, s = np.cos(th), np.sin(th)
+            yield anchor + np.array(
+                [c * r_start[0] - s * r_start[1],
+                 s * r_start[0] + c * r_start[1], 0.0])
+
+    def _clear(p, skip):
+        for j in range(n_total):
+            if j == my_idx or j in skip:
+                continue
+            if float(np.linalg.norm(p - pos[j])) < _PLANAR_SWEEP_CLEARANCE:
+                return False
+        return True
+
+    p_contact = None
+    for p in _arc_pts(a, r0, sgn1, d1):
+        p_contact = p
+        if not _clear(p, skip=(axis_idx, handoff_idx)):
+            return False
+    if p_contact is None:
+        p_contact = pos[my_idx]
+    rc = p_contact - h
+    rt = np.asarray(target_world, dtype=float) - h
+    nc, nt = float(np.linalg.norm(rc)), float(np.linalg.norm(rt))
+    if nc < 1e-9 or nt < 1e-9:
+        return True
+    cos2 = float(np.clip(np.dot(rc, rt) / (nc * nt), -1.0, 1.0))
+    d2 = float(np.arccos(cos2))
+    sgn2 = 1.0 if (rc[0] * rt[1] - rc[1] * rt[0]) >= 0.0 else -1.0
+    for p in _arc_pts(h, rc, sgn2, d2):
+        if not _clear(p, skip=(handoff_idx,)):
+            return False
+    return True
+
 # Eligibility: angle between pivot–axis arm and axis→target leg (same vectors as
 # pick_target).  Perpendicular lattice steps should give cos≈0 for corners.
 # Old threshold 0.99 only rejected within ~8° of 0°/180° (~171° still passed).
@@ -922,6 +1041,13 @@ class DecentralizedCoagulation:
                     delta, arm_axis_to_pivot, R)
                 dw = nom * np.array(delta, dtype=float)
                 target_world = p_ref + R @ dw
+                if PLANAR_Z_LOCK:
+                    if abs(target_world[2]) > 1e-6:
+                        continue
+                    if not _planar_pivot_admissible(
+                            pos, agent.body_idx, axis_idx, target_world,
+                            len(pos)):
+                        continue
                 target_cell = tuple(
                     np.round(R.T @ (target_world - p_ref) / nom).astype(int))
                 axial_into_ghost = (
@@ -953,6 +1079,11 @@ class DecentralizedCoagulation:
                         continue
                 dist_to_origin = float(np.linalg.norm(target_world - origin))
                 score = -dist_to_origin
+                if PLANAR_Z_LOCK:
+                    # planar demos: break score ties randomly so the
+                    # deterministic kinematic sim samples different paths
+                    # across attempts
+                    score += random.uniform(0.0, 1e-3)
                 t_local = R.T @ (target_world - p_ref)
                 scored.append((score, t_local, axis_idx, "corner", None))
 
@@ -975,6 +1106,13 @@ class DecentralizedCoagulation:
                         self.sim, axis_idx, d_ah):
                     continue
                 target_world = pos[handoff_idx] + (my_pos - pos[axis_idx])
+                if PLANAR_Z_LOCK:
+                    if abs(target_world[2]) > 1e-6:
+                        continue
+                    if not _planar_lateral_clear(
+                            pos, agent.body_idx, axis_idx, handoff_idx,
+                            target_world, len(pos)):
+                        continue
                 target_cell = tuple(
                     np.round(R.T @ (target_world - p_ref) / nom).astype(int))
                 if target_cell in occupied or target_cell == my_cell:
@@ -1000,6 +1138,11 @@ class DecentralizedCoagulation:
                         continue
                 dist_to_origin = float(np.linalg.norm(target_world - origin))
                 score = -dist_to_origin
+                if PLANAR_Z_LOCK:
+                    # planar demos: break score ties randomly so the
+                    # deterministic kinematic sim samples different paths
+                    # across attempts
+                    score += random.uniform(0.0, 1e-3)
                 t_local = R.T @ (target_world - p_ref)
                 scored.append((score, t_local, axis_idx, "lateral", handoff_idx))
 
@@ -1585,6 +1728,18 @@ class DecentralizedCoagulation:
                                         np.linalg.norm(r_target) + 1e-12),
             -1, 1)
         angle = np.arccos(cos_angle)
+
+        # Planar demos: if the short arc would sweep through another
+        # module but the complementary arc is clear, roll the long way
+        # around the free side instead.
+        if PLANAR_Z_LOCK and pivot_type == "corner":
+            if (not _planar_arc_clear(
+                    pos, agent.body_idx, axis_idx, target_world, len(pos))
+                    and _planar_arc_clear(
+                        pos, agent.body_idx, axis_idx, target_world,
+                        len(pos), long_way=True)):
+                rot_axis = -rot_axis
+                angle = 2.0 * np.pi - angle
 
         kp, kd = self.sim.compute_pd_gains(r_vec, duration=12.0)
 
@@ -2371,6 +2526,13 @@ class DecentralizedRestructuring:
                     delta, arm_axis_to_pivot, R)
                 dw = nom * np.array(delta, dtype=float)
                 target_world = p_ref + R @ dw
+                if PLANAR_Z_LOCK:
+                    if abs(target_world[2]) > 1e-6:
+                        continue
+                    if not _planar_pivot_admissible(
+                            pos, agent.body_idx, axis_idx, target_world,
+                            len(pos)):
+                        continue
                 target_cell = tuple(
                     np.round(R.T @ (target_world - p_ref) / nom).astype(int))
                 axial_into_ghost = (
@@ -2418,6 +2580,13 @@ class DecentralizedRestructuring:
                         self.sim, axis_idx, d_ah):
                     continue
                 target_world = pos[handoff_idx] + (my_pos - pos[axis_idx])
+                if PLANAR_Z_LOCK:
+                    if abs(target_world[2]) > 1e-6:
+                        continue
+                    if not _planar_lateral_clear(
+                            pos, agent.body_idx, axis_idx, handoff_idx,
+                            target_world, len(pos)):
+                        continue
                 target_cell = tuple(
                     np.round(R.T @ (target_world - p_ref) / nom).astype(int))
                 if target_cell in occupied or target_cell == my_cell:

@@ -381,6 +381,7 @@ def _run_phase(
     stall_patience: int,
     phase_label: str = "phase",
     heartbeat_wall_secs: float = 30.0,
+    frame_callback: Optional[Callable[[Any, Any, int], None]] = None,
 ) -> int:
     """Run a simulation phase. Returns tick count.
 
@@ -391,6 +392,10 @@ def _run_phase(
     Heartbeat: every ``heartbeat_wall_secs`` of wall time, prints a status
     line with current tick count, sim time, successful_moves, and the
     distribution of completed_moves across agents.
+
+    ``frame_callback(sim, policy, ticks)``, when given, is invoked once
+    before the loop (ticks=0) and after every tick — used by rendering
+    scripts to record trajectories.
     """
     del max_time, stall_interval, stall_patience
     import time as _time
@@ -398,10 +403,14 @@ def _run_phase(
     ticks = 0
     t0 = _time.monotonic()
     last_hb = t0
+    if frame_callback is not None:
+        frame_callback(sim, policy, ticks)
     while True:
         sim.step(dt)
         policy.tick()
         ticks += 1
+        if frame_callback is not None:
+            frame_callback(sim, policy, ticks)
         if done_fn(policy, sim):
             break
         now = _time.monotonic()
@@ -485,6 +494,7 @@ def run_trial(
     forward_ap_cost: float = 0.1,
     fault_mode: str = FAULT_MODE_RANDOM,
     diagnostics_callback: Optional[Callable[..., None]] = None,
+    frame_callback: Optional[Callable[[Any, Any, str, int], None]] = None,
 ) -> TrialResult:
     """Drive a single MC trial on an already-constructed simulator.
 
@@ -537,7 +547,10 @@ def run_trial(
     phase1_ticks = _run_phase(
         sim, coag, _phase1_done, dt,
         max_time=0.0, stall_interval=0.0, stall_patience=0,
-        phase_label=f"coag[t{trial_id}/n{n_modules}/f{n_faults}]")
+        phase_label=f"coag[t{trial_id}/n{n_modules}/f{n_faults}]",
+        frame_callback=(
+            (lambda s, p, t: frame_callback(s, p, "coagulation", t))
+            if frame_callback is not None else None))
 
     phase1_connected = coag.is_connected()
     total_phase1_moves = coag.total_moves
@@ -603,7 +616,10 @@ def run_trial(
         _run_phase(
             sim, restruct, _phase2_done, dt,
             max_time=0.0, stall_interval=0.0, stall_patience=0,
-            phase_label=f"restruct[t{trial_id}/n{n_modules}/f{n_faults}]")
+            phase_label=f"restruct[t{trial_id}/n{n_modules}/f{n_faults}]",
+            frame_callback=(
+                (lambda s, p, t: frame_callback(s, p, "restructuring", t))
+                if frame_callback is not None else None))
 
         total_phase2_moves = restruct.total_moves
 

@@ -38,6 +38,10 @@ class PivotState:
     completed: bool = False
     timed_out: bool = False
     collided: bool = False
+    # Optional piecewise rolling path (TWO_ARC_LATERAL): list of
+    # (anchor_pos, r_start, rot_axis_unit, dtheta) segments traversed in
+    # order; interpolation walks them by cumulative angle.
+    segments: Optional[list] = None
 
 
 def _rotation_matrix_axis_angle(axis: np.ndarray, angle: float) -> np.ndarray:
@@ -84,6 +88,13 @@ class GraphSimulator:
     # collapses that to 0.2 s = 2 ticks at dt=0.1, the minimum that
     # preserves a clean mid-flight handoff window.
     PIVOT_DURATION_SCALE = 1.0 / 60.0
+
+    # When True, lateral handoffs interpolate along the physically rolled
+    # two-arc path (around the axis until contact with the handoff module,
+    # then around the handoff to the target) instead of the single-arc +
+    # end-snap approximation. Off by default (MC parity); animation demos
+    # can enable it per class/instance.
+    TWO_ARC_LATERAL = False
 
     def __init__(self, N: int, pos0: np.ndarray, bonded0: np.ndarray,
                  vel0: Optional[np.ndarray] = None, gui: bool = False,
@@ -142,6 +153,22 @@ class GraphSimulator:
                 ps.completed = True
                 continue
             frac = ps.t / max(ps.duration, 1e-9)
+            if ps.segments:
+                total = sum(seg[3] for seg in ps.segments)
+                s = total * frac
+                p = ps.start_pos
+                for anchor, r_start, seg_axis, dtheta in ps.segments:
+                    step_ang = min(s, dtheta)
+                    R_seg = _rotation_matrix_axis_angle(seg_axis, step_ang)
+                    p = anchor + R_seg @ r_start
+                    s -= step_ang
+                    if s <= 1e-12:
+                        break
+                self._positions[pivot_idx] = p
+                R_partial = _rotation_matrix_axis_angle(
+                    ps.rot_axis, ps.target_angle * frac)
+                self._orientations[pivot_idx] = R_partial @ ps.start_orient
+                continue
             theta = ps.target_angle * frac
             R_partial = _rotation_matrix_axis_angle(ps.rot_axis, theta)
             r0 = ps.start_pos - self._positions[ps.axis_idx]
@@ -233,7 +260,52 @@ class GraphSimulator:
             pivot_type=str(pivot_type),
             repel_idx=int(repel_idx) if repel_idx is not None else None,
         )
+        if (self.TWO_ARC_LATERAL and ps.pivot_type == "lateral"
+                and 0 <= ps.attract_body_idx < self.N):
+            ps.segments = self._lateral_two_arc_segments(pivot_idx, ps)
         self._active_pivots[int(pivot_idx)] = ps
+
+    def _lateral_two_arc_segments(self, pivot_idx: int, ps: PivotState):
+        """Rolled lateral path: arc about the axis body until contact with
+        the handoff body, then arc about the handoff to the target. Returns
+        a list of (anchor_pos, r_start, rot_axis_unit, dtheta) segments, or
+        None when the geometry degenerates (falls back to the single arc).
+        """
+        a = self._positions[ps.axis_idx].copy()
+        h = self._positions[ps.attract_body_idx].copy()
+        p0 = ps.start_pos
+        tgt = ps.target_pos
+        nom = float(self.NOMINAL_DIST)
+        r0 = p0 - a
+        rh = h - a
+        n0, nh = float(np.linalg.norm(r0)), float(np.linalg.norm(rh))
+        if n0 < 1e-9 or nh < 1e-9:
+            return None
+        axis1 = np.cross(r0, rh)
+        if float(np.linalg.norm(axis1)) < 1e-9:
+            return None
+        axis1 /= np.linalg.norm(axis1)
+        cos_sep = float(np.clip(np.dot(r0, rh) / (n0 * nh), -1.0, 1.0))
+        sep0 = float(np.arccos(cos_sep))
+        # contact separation: |p - h| = nom on circles of radius n0, nh
+        cos_c = (n0 * n0 + nh * nh - nom * nom) / (2.0 * n0 * nh)
+        if not -1.0 <= cos_c <= 1.0:
+            return None
+        sep_c = float(np.arccos(cos_c))
+        d1 = max(0.0, sep0 - sep_c)
+        p_contact = a + _rotation_matrix_axis_angle(axis1, d1) @ r0
+        rc = p_contact - h
+        rt = tgt - h
+        nc, nt = float(np.linalg.norm(rc)), float(np.linalg.norm(rt))
+        if nc < 1e-9 or nt < 1e-9:
+            return None
+        axis2 = np.cross(rc, rt)
+        if float(np.linalg.norm(axis2)) < 1e-9:
+            return None
+        axis2 /= np.linalg.norm(axis2)
+        cos2 = float(np.clip(np.dot(rc, rt) / (nc * nt), -1.0, 1.0))
+        d2 = float(np.arccos(cos2))
+        return [(a, r0, axis1, d1), (h, rc, axis2, d2)]
 
     def stop_pivot(self, pivot_idx: int, restore_axis_bond: bool = True):
         """End an active pivot.
