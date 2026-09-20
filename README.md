@@ -74,24 +74,33 @@ pip install -r requirements.txt
 ### Quick Start
 
 ```python
-from src.udqdg_system import UDQDGSystem
-from src.configurations import create_random_configuration
+from src.monte_carlo import run_single_graph_trial
 
-# Create a random 15-module system
-system = create_random_configuration(15, seed=42)
-
-# Inject a fault and run the full repair algorithm
-result = system.full_damage_response(
-    fault_module_id="M5",
-    token_strategy="furthest",
+# Generate a 15-module fully-connected structure, inject one fault that
+# actually disconnects the active graph (auto-retries seeds up to 500x),
+# and run the full decentralized coag + restruct pipeline on a
+# GraphSimulator (perfect kinematic pivots, no physics).
+result = run_single_graph_trial(
+    n_modules=15,
+    n_faults=1,
+    seed=42,
+    fully_connected=True,
+    restructuring_method="displacement",
+    temperature=0.5,
+    use_flood_echo=False,
+    max_moves_per_module=10,
     safety_radius=2,
 )
 
-print(f"Reconnected: {result['phase1']['reconnected']}")
-print(f"Phase 1 moves: {result['phase1']['total_moves']}")
-print(f"Phase 2 moves: {result['phase2']['restoration_moves']}")
-print(f"Overall success: {result['overall_success']}")
+print(f"Reconnected: {result.restored}")
+print(f"Phase 1 moves: {result.phase1_moves}")
+print(f"Phase 2 moves: {result.phase2_moves}")
+print(f"Shape difference: {result.shape_difference}")
 ```
+
+The same call signature drives the PyBullet runner via
+``run_single_bullet_trial`` in `run_bullet_monte_carlo.py` — both
+runners share the simulator-agnostic trial driver in `src/mc_runner.py`.
 
 ## Monte Carlo Simulation
 
